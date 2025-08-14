@@ -7,6 +7,10 @@
 (define-constant err-invalid-batch-size (err u105))
 (define-constant err-insufficient-payment (err u106))
 (define-constant err-invalid-target (err u107))
+(define-constant err-schedule-not-ready (err u108))
+(define-constant err-schedule-expired (err u109))
+(define-constant err-schedule-not-found (err u110))
+(define-constant err-schedule-already-executed (err u111))
 
 (define-data-var contract-enabled bool true)
 (define-data-var max-batch-size uint u50)
@@ -30,6 +34,22 @@
   })
 
 (define-data-var next-batch-id uint u1)
+(define-data-var next-schedule-id uint u1)
+(define-data-var schedule-execution-window uint u144)
+
+(define-map scheduled-batches
+  { schedule-id: uint }
+  {
+    user: principal,
+    targets: (list 50 principal),
+    function-names: (list 50 (string-ascii 50)),
+    arguments-list: (list 50 (list 10 uint)),
+    execution-block: uint,
+    expiry-block: uint,
+    fee-payment: uint,
+    executed: bool,
+    created-at: uint
+  })
 
 (define-public (enable-contract)
   (begin
@@ -233,3 +253,160 @@
       estimated-fee: total-fee,
       max-batch-size: (var-get max-batch-size)
     })))
+
+(define-public (schedule-batch-execution
+  (targets (list 50 principal))
+  (function-names (list 50 (string-ascii 50)))
+  (arguments-list (list 50 (list 10 uint)))
+  (execution-block uint)
+  (fee-payment uint))
+  (let
+    (
+      (user tx-sender)
+      (batch-size (len targets))
+      (total-fee (calculate-batch-fee batch-size))
+      (current-schedule-id (var-get next-schedule-id))
+      (expiry-block (+ execution-block (var-get schedule-execution-window)))
+    )
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (<= batch-size (var-get max-batch-size)) err-invalid-batch-size)
+    (asserts! (>= fee-payment total-fee) err-insufficient-payment)
+    (asserts! (> execution-block stacks-block-height) err-schedule-not-ready)
+    
+    (map-set scheduled-batches
+      { schedule-id: current-schedule-id }
+      {
+        user: user,
+        targets: targets,
+        function-names: function-names,
+        arguments-list: arguments-list,
+        execution-block: execution-block,
+        expiry-block: expiry-block,
+        fee-payment: fee-payment,
+        executed: false,
+        created-at: stacks-block-height
+      })
+    
+    (var-set next-schedule-id (+ current-schedule-id u1))
+    (ok { 
+      schedule-id: current-schedule-id,
+      execution-block: execution-block,
+      expiry-block: expiry-block,
+      estimated-fee: total-fee
+    })))
+
+(define-public (execute-scheduled-batch (schedule-id uint))
+  (let
+    (
+      (schedule-data (unwrap! (map-get? scheduled-batches { schedule-id: schedule-id }) err-schedule-not-found))
+      (execution-block (get execution-block schedule-data))
+      (expiry-block (get expiry-block schedule-data))
+      (user (get user schedule-data))
+      (targets (get targets schedule-data))
+      (function-names (get function-names schedule-data))
+      (arguments-list (get arguments-list schedule-data))
+      (fee-payment (get fee-payment schedule-data))
+      (current-nonce (default-to u0 (map-get? user-nonces user)))
+      (new-nonce (+ current-nonce u1))
+      (current-batch-id (var-get next-batch-id))
+    )
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (not (get executed schedule-data)) err-schedule-already-executed)
+    (asserts! (>= stacks-block-height execution-block) err-schedule-not-ready)
+    (asserts! (<= stacks-block-height expiry-block) err-schedule-expired)
+    (asserts! (or (is-eq tx-sender user) 
+                  (default-to false (map-get? authorized-executors tx-sender))) 
+              err-unauthorized)
+    
+    (map-set user-nonces user new-nonce)
+    (map-set transaction-history 
+      { user: user, nonce: new-nonce } 
+      { executed: true, stacks-block-height: stacks-block-height, fee-paid: fee-payment })
+    
+    (map-set scheduled-batches
+      { schedule-id: schedule-id }
+      (merge schedule-data { executed: true }))
+    
+    (let
+      (
+        (execution-results (execute-transaction-batch targets function-names arguments-list))
+        (successful-count (get successful-transactions execution-results))
+        (batch-size (len targets))
+      )
+      (map-set batch-execution-results
+        { batch-id: current-batch-id }
+        { 
+          user: user, 
+          total-transactions: batch-size,
+          successful-transactions: successful-count,
+          total-fee: fee-payment,
+          executed-at: stacks-block-height
+        })
+      
+      (var-set next-batch-id (+ current-batch-id u1))
+      (ok { 
+        schedule-id: schedule-id,
+        batch-id: current-batch-id,
+        successful-transactions: successful-count,
+        total-transactions: batch-size,
+        executed-at: stacks-block-height
+      }))))
+
+(define-public (cancel-scheduled-batch (schedule-id uint))
+  (let
+    (
+      (schedule-data (unwrap! (map-get? scheduled-batches { schedule-id: schedule-id }) err-schedule-not-found))
+      (user (get user schedule-data))
+    )
+    (asserts! (is-eq tx-sender user) err-unauthorized)
+    (asserts! (not (get executed schedule-data)) err-schedule-already-executed)
+    
+    (map-delete scheduled-batches { schedule-id: schedule-id })
+    (ok { schedule-id: schedule-id, cancelled: true })))
+
+(define-public (set-schedule-execution-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set schedule-execution-window new-window)
+    (ok true)))
+
+(define-read-only (get-scheduled-batch (schedule-id uint))
+  (map-get? scheduled-batches { schedule-id: schedule-id }))
+
+(define-read-only (is-schedule-ready (schedule-id uint))
+  (match (map-get? scheduled-batches { schedule-id: schedule-id })
+    schedule-data 
+      (and 
+        (not (get executed schedule-data))
+        (>= stacks-block-height (get execution-block schedule-data))
+        (<= stacks-block-height (get expiry-block schedule-data)))
+    false))
+
+(define-read-only (get-schedule-status (schedule-id uint))
+  (match (map-get? scheduled-batches { schedule-id: schedule-id })
+    schedule-data
+      (if (get executed schedule-data)
+        "executed"
+        (if (> stacks-block-height (get expiry-block schedule-data))
+          "expired"
+          (if (>= stacks-block-height (get execution-block schedule-data))
+            "ready"
+            "pending")))
+    "not-found"))
+
+(define-read-only (get-user-scheduled-batches (user principal))
+  (let
+    (
+      (schedule-ids (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+    )
+    (filter is-user-schedule (map get-schedule-with-id schedule-ids))))
+
+(define-private (get-schedule-with-id (schedule-id uint))
+  (match (map-get? scheduled-batches { schedule-id: schedule-id })
+    schedule-data (some { schedule-id: schedule-id, data: schedule-data })
+    none))
+
+(define-private (is-user-schedule (schedule-entry (optional { schedule-id: uint, data: { user: principal, targets: (list 50 principal), function-names: (list 50 (string-ascii 50)), arguments-list: (list 50 (list 10 uint)), execution-block: uint, expiry-block: uint, fee-payment: uint, executed: bool, created-at: uint } })))
+  (match schedule-entry
+    entry (is-eq tx-sender (get user (get data entry)))
+    false))
