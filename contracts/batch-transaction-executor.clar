@@ -14,6 +14,9 @@
 (define-constant err-condition-not-met (err u112))
 (define-constant err-cooldown-active (err u113))
 (define-constant err-insufficient-balance (err u114))
+(define-constant err-template-not-found (err u115))
+(define-constant err-template-already-exists (err u116))
+(define-constant err-not-template-owner (err u117))
 
 (define-data-var contract-enabled bool true)
 (define-data-var max-batch-size uint u50)
@@ -69,6 +72,26 @@
 (define-map user-execution-cooldowns
   { user: principal }
   { last-execution: uint })
+
+(define-data-var next-template-id uint u1)
+
+(define-map batch-templates
+  { template-id: uint }
+  {
+    owner: principal,
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    targets: (list 50 principal),
+    function-names: (list 50 (string-ascii 50)),
+    arguments-list: (list 50 (list 10 uint)),
+    created-at: uint,
+    execution-count: uint,
+    is-active: bool
+  })
+
+(define-map user-template-names
+  { user: principal, name: (string-ascii 50) }
+  { template-id: uint })
 
 (define-public (enable-contract)
   (begin
@@ -610,4 +633,212 @@
                                    u0)
                                  (get max-executions-per-period condition-data))
         }))
+    none))
+
+(define-public (create-batch-template
+  (name (string-ascii 50))
+  (description (string-ascii 200))
+  (targets (list 50 principal))
+  (function-names (list 50 (string-ascii 50)))
+  (arguments-list (list 50 (list 10 uint))))
+  (let
+    (
+      (user tx-sender)
+      (current-template-id (var-get next-template-id))
+      (batch-size (len targets))
+      (existing-template (map-get? user-template-names { user: user, name: name }))
+    )
+    (asserts! (is-none existing-template) err-template-already-exists)
+    (asserts! (<= batch-size (var-get max-batch-size)) err-invalid-batch-size)
+    
+    (map-set batch-templates
+      { template-id: current-template-id }
+      {
+        owner: user,
+        name: name,
+        description: description,
+        targets: targets,
+        function-names: function-names,
+        arguments-list: arguments-list,
+        created-at: stacks-block-height,
+        execution-count: u0,
+        is-active: true
+      })
+    
+    (map-set user-template-names
+      { user: user, name: name }
+      { template-id: current-template-id })
+    
+    (var-set next-template-id (+ current-template-id u1))
+    (ok { template-id: current-template-id, name: name })))
+
+(define-public (execute-batch-from-template (template-id uint))
+  (let
+    (
+      (template-data (unwrap! (map-get? batch-templates { template-id: template-id }) err-template-not-found))
+      (user tx-sender)
+      (owner (get owner template-data))
+      (targets (get targets template-data))
+      (function-names (get function-names template-data))
+      (arguments-list (get arguments-list template-data))
+      (current-nonce (default-to u0 (map-get? user-nonces user)))
+      (new-nonce (+ current-nonce u1))
+      (batch-size (len targets))
+      (total-fee (+ (var-get base-fee) (* (var-get per-transaction-fee) batch-size)))
+      (current-batch-id (var-get next-batch-id))
+    )
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (get is-active template-data) err-template-not-found)
+    (asserts! (is-eq user owner) err-not-template-owner)
+    
+    (map-set user-nonces user new-nonce)
+    (map-set transaction-history 
+      { user: user, nonce: new-nonce } 
+      { executed: true, stacks-block-height: stacks-block-height, fee-paid: total-fee })
+    
+    (update-execution-tracking user)
+    
+    (map-set batch-templates
+      { template-id: template-id }
+      (merge template-data { execution-count: (+ (get execution-count template-data) u1) }))
+    
+    (let
+      (
+        (execution-results (execute-transaction-batch targets function-names arguments-list))
+        (successful-count (get successful-transactions execution-results))
+      )
+      (map-set batch-execution-results
+        { batch-id: current-batch-id }
+        { 
+          user: user, 
+          total-transactions: batch-size,
+          successful-transactions: successful-count,
+          total-fee: total-fee,
+          executed-at: stacks-block-height
+        })
+      
+      (var-set next-batch-id (+ current-batch-id u1))
+      (ok { 
+        batch-id: current-batch-id,
+        template-id: template-id,
+        successful-transactions: successful-count,
+        total-transactions: batch-size,
+        fee-charged: total-fee
+      }))))
+
+(define-public (update-batch-template
+  (template-id uint)
+  (name (string-ascii 50))
+  (description (string-ascii 200))
+  (targets (list 50 principal))
+  (function-names (list 50 (string-ascii 50)))
+  (arguments-list (list 50 (list 10 uint))))
+  (let
+    (
+      (template-data (unwrap! (map-get? batch-templates { template-id: template-id }) err-template-not-found))
+      (user tx-sender)
+      (old-name (get name template-data))
+      (batch-size (len targets))
+    )
+    (asserts! (is-eq user (get owner template-data)) err-not-template-owner)
+    (asserts! (<= batch-size (var-get max-batch-size)) err-invalid-batch-size)
+    
+    (if (not (is-eq name old-name))
+      (begin
+        (map-delete user-template-names { user: user, name: old-name })
+        (map-set user-template-names { user: user, name: name } { template-id: template-id }))
+      true)
+    
+    (map-set batch-templates
+      { template-id: template-id }
+      (merge template-data {
+        name: name,
+        description: description,
+        targets: targets,
+        function-names: function-names,
+        arguments-list: arguments-list
+      }))
+    
+    (ok { template-id: template-id, updated: true })))
+
+(define-public (deactivate-batch-template (template-id uint))
+  (let
+    (
+      (template-data (unwrap! (map-get? batch-templates { template-id: template-id }) err-template-not-found))
+      (user tx-sender)
+    )
+    (asserts! (is-eq user (get owner template-data)) err-not-template-owner)
+    
+    (map-set batch-templates
+      { template-id: template-id }
+      (merge template-data { is-active: false }))
+    
+    (ok { template-id: template-id, deactivated: true })))
+
+(define-public (activate-batch-template (template-id uint))
+  (let
+    (
+      (template-data (unwrap! (map-get? batch-templates { template-id: template-id }) err-template-not-found))
+      (user tx-sender)
+    )
+    (asserts! (is-eq user (get owner template-data)) err-not-template-owner)
+    
+    (map-set batch-templates
+      { template-id: template-id }
+      (merge template-data { is-active: true }))
+    
+    (ok { template-id: template-id, activated: true })))
+
+(define-public (delete-batch-template (template-id uint))
+  (let
+    (
+      (template-data (unwrap! (map-get? batch-templates { template-id: template-id }) err-template-not-found))
+      (user tx-sender)
+      (template-name (get name template-data))
+    )
+    (asserts! (is-eq user (get owner template-data)) err-not-template-owner)
+    
+    (map-delete batch-templates { template-id: template-id })
+    (map-delete user-template-names { user: user, name: template-name })
+    
+    (ok { template-id: template-id, deleted: true })))
+
+(define-read-only (get-batch-template (template-id uint))
+  (map-get? batch-templates { template-id: template-id }))
+
+(define-read-only (get-template-by-name (user principal) (name (string-ascii 50)))
+  (match (map-get? user-template-names { user: user, name: name })
+    template-ref
+      (map-get? batch-templates { template-id: (get template-id template-ref) })
+    none))
+
+(define-read-only (get-template-id-by-name (user principal) (name (string-ascii 50)))
+  (map-get? user-template-names { user: user, name: name }))
+
+(define-read-only (get-user-templates (user principal))
+  (let
+    (
+      (template-ids (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20))
+    )
+    (filter is-user-template (map get-template-with-id template-ids))))
+
+(define-private (get-template-with-id (template-id uint))
+  (match (map-get? batch-templates { template-id: template-id })
+    template-data (some { template-id: template-id, data: template-data })
+    none))
+
+(define-private (is-user-template (template-entry (optional { template-id: uint, data: { owner: principal, name: (string-ascii 50), description: (string-ascii 200), targets: (list 50 principal), function-names: (list 50 (string-ascii 50)), arguments-list: (list 50 (list 10 uint)), created-at: uint, execution-count: uint, is-active: bool } })))
+  (match template-entry
+    entry (is-eq tx-sender (get owner (get data entry)))
+    false))
+
+(define-read-only (get-template-execution-stats (template-id uint))
+  (match (map-get? batch-templates { template-id: template-id })
+    template-data
+      (some {
+        template-id: template-id,
+        execution-count: (get execution-count template-data),
+        created-at: (get created-at template-data),
+        is-active: (get is-active template-data)
+      })
     none))
