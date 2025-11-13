@@ -93,6 +93,8 @@
   { user: principal, name: (string-ascii 50) }
   { template-id: uint })
 
+(define-map user-fee-balances principal uint)
+
 (define-public (enable-contract)
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -526,16 +528,17 @@
       (existing-conditions (default-to 
         { min-balance: u0, cooldown-blocks: u0, last-execution-block: u0, min-block-height: u0, max-executions-per-period: u10, execution-count-current-period: u0, period-start-block: u0 }
         (map-get? execution-conditions { user: user })))
-    )
-    (map-set execution-conditions 
-      { user: user }
-      (merge existing-conditions {
+      (new-conditions (merge existing-conditions {
         min-balance: min-balance,
         cooldown-blocks: cooldown-blocks,
         min-block-height: min-block-height,
         max-executions-per-period: max-executions-per-period
       }))
-    (ok true)))
+    )
+    (begin
+      (map-set execution-conditions { user: user } new-conditions)
+      (ok true)
+    )))
 
 (define-public (execute-batch-with-conditions
   (targets (list 50 principal))
@@ -842,3 +845,80 @@
         is-active: (get is-active template-data)
       })
     none))
+
+(define-read-only (get-fee-balance (user principal))
+  (default-to u0 (map-get? user-fee-balances user)))
+
+(define-public (deposit-fees (amount uint))
+  (let
+    (
+      (user tx-sender)
+      (current (default-to u0 (map-get? user-fee-balances user)))
+      (new (+ current amount))
+    )
+    (asserts! (> amount u0) err-insufficient-payment)
+    (unwrap! (as-contract (stx-transfer? amount user tx-sender)) err-insufficient-balance)
+    (map-set user-fee-balances user new)
+    (ok { balance: new })))
+
+(define-public (withdraw-deposit (amount uint))
+  (let
+    (
+      (user tx-sender)
+      (current (default-to u0 (map-get? user-fee-balances user)))
+      (remaining (- current amount))
+    )
+    (asserts! (>= current amount) err-insufficient-balance)
+    (unwrap! (as-contract (stx-transfer? amount tx-sender user)) err-execution-failed)
+    (map-set user-fee-balances user remaining)
+    (ok { balance: remaining })))
+
+(define-public (execute-batch-from-deposit
+  (targets (list 50 principal))
+  (function-names (list 50 (string-ascii 50)))
+  (arguments-list (list 50 (list 10 uint))))
+  (let
+    (
+      (user tx-sender)
+      (current-nonce (default-to u0 (map-get? user-nonces user)))
+      (new-nonce (+ current-nonce u1))
+      (batch-size (len targets))
+      (fee (calculate-batch-fee batch-size))
+      (balance (default-to u0 (map-get? user-fee-balances user)))
+      (current-batch-id (var-get next-batch-id))
+    )
+    (asserts! (var-get contract-enabled) err-owner-only)
+    (asserts! (<= batch-size (var-get max-batch-size)) err-invalid-batch-size)
+    (unwrap! (check-execution-conditions user) err-condition-not-met)
+    (asserts! (>= balance fee) err-insufficient-balance)
+    (map-set user-fee-balances user (- balance fee))
+    (unwrap! (as-contract (stx-transfer? fee tx-sender contract-owner)) err-execution-failed)
+    (map-set user-nonces user new-nonce)
+    (map-set transaction-history 
+      { user: user, nonce: new-nonce } 
+      { executed: true, stacks-block-height: stacks-block-height, fee-paid: fee })
+    (update-execution-tracking user)
+    (let
+      (
+        (execution-results (execute-transaction-batch targets function-names arguments-list))
+        (successful-count (get successful-transactions execution-results))
+      )
+      (map-set batch-execution-results
+        { batch-id: current-batch-id }
+        { 
+          user: user, 
+          total-transactions: batch-size,
+          successful-transactions: successful-count,
+          total-fee: fee,
+          executed-at: stacks-block-height
+        })
+      (var-set next-batch-id (+ current-batch-id u1))
+      (ok { 
+        batch-id: current-batch-id,
+        successful-transactions: successful-count,
+        total-transactions: batch-size,
+        fee-charged: fee,
+        deposit-remaining: (default-to u0 (map-get? user-fee-balances user))
+      }))
+    )
+  ) 
