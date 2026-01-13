@@ -25,6 +25,9 @@
 
 (define-map user-nonces principal uint)
 (define-map authorized-executors principal bool)
+(define-map user-authorized-executors 
+  { user: principal, executor: principal } 
+  bool)
 (define-map transaction-history 
   { user: principal, nonce: uint } 
   { executed: bool, stacks-block-height: uint, fee-paid: uint })
@@ -153,7 +156,8 @@
     (unwrap! (check-execution-conditions user) err-condition-not-met)
     (asserts! (>= fee-payment total-fee) err-insufficient-payment)
     (asserts! (or (is-eq tx-sender user) 
-                  (default-to false (map-get? authorized-executors tx-sender))) 
+                  (default-to false (map-get? authorized-executors tx-sender))
+                  (default-to false (map-get? user-authorized-executors { user: user, executor: tx-sender }))) 
               err-unauthorized)
     
     (map-set user-nonces user nonce)
@@ -185,6 +189,19 @@
         total-transactions: batch-size,
         fee-charged: fee-payment
       }))))
+
+(define-public (authorize-executor-for-user (executor principal))
+  (begin
+    (map-set user-authorized-executors { user: tx-sender, executor: executor } true)
+    (ok true)))
+
+(define-public (revoke-executor-for-user (executor principal))
+  (begin
+    (map-delete user-authorized-executors { user: tx-sender, executor: executor })
+    (ok true)))
+
+(define-read-only (is-executor-authorized-for-user (user principal) (executor principal))
+  (default-to false (map-get? user-authorized-executors { user: user, executor: executor })))
 
 (define-public (execute-batch-transaction
   (targets (list 50 principal))
